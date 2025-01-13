@@ -1,0 +1,212 @@
+import os
+import socket
+import wave
+import threading
+import keyboard
+import time
+import numpy as np
+import json
+import logging
+from vosk import Model, KaldiRecognizer
+from flask import Flask, jsonify, send_file, abort
+
+# Set up logging
+logging.basicConfig(level=logging.INFO, format='%(asctime)s - %(levelname)s - %(message)s')
+
+# ESP32 IP address and port number
+ESP32_IP = '192.168.4.1'
+ESP32_PORT = 12345
+
+# File paths
+raw_audio_filename = 'recorded_audio.raw'
+wav_audio_filename = 'audio_file.wav'
+transcription_file = 'transcription.txt'
+feedback_file = 'feedback_file.txt'
+summary_file = 'summary.txt'
+model_path = r"C:\\Users\\Sibo\\OneDrive - University of Kelaniya\\Desktop\\python\\models\\vosk-model-en-us-0.42-gigaspeech"
+
+# Ensure files are created in the same directory as this script
+base_dir = os.path.dirname(os.path.abspath(__file__))
+raw_audio_path = os.path.join(base_dir, raw_audio_filename)
+wav_audio_path = os.path.join(base_dir, wav_audio_filename)
+transcription_path = os.path.join(base_dir, transcription_file)
+feedback_path = os.path.join(base_dir, feedback_file)
+summary_path = os.path.join(base_dir, summary_file)
+
+# Flask app
+app = Flask(__name__)
+
+# Stop flag
+stop_receiving = False
+
+# Function to receive audio data from ESP32
+def receive_audio():
+    global stop_receiving
+    try:
+        with socket.socket(socket.AF_INET, socket.SOCK_STREAM) as sock:
+            sock.connect((ESP32_IP, ESP32_PORT))
+            logging.info("Connected to ESP32")
+
+            with open(raw_audio_path, 'wb') as file:
+                while not stop_receiving:
+                    data = sock.recv(1024)
+                    if not data:
+                        break
+                    file.write(data)
+                    logging.info(f"Received {len(data)} bytes")
+
+            logging.info("Finished receiving audio data.")
+    except Exception as e:
+        logging.error(f"Error receiving data: {e}")
+
+# Function to convert raw audio to WAV
+def convert_to_wav():
+    try:
+        logging.info("Converting raw audio to WAV format...")
+        with open(raw_audio_path, 'rb') as raw_file:
+            raw_data = raw_file.read()
+
+        audio_data = np.frombuffer(raw_data, dtype=np.int16)
+        with wave.open(wav_audio_path, 'wb') as wav_file:
+            wav_file.setnchannels(1)
+            wav_file.setsampwidth(2)
+            wav_file.setframerate(44100)
+            wav_file.writeframes(audio_data.tobytes())
+
+        logging.info(f"Audio saved as {wav_audio_path}")
+    except Exception as e:
+        logging.error(f"Error during conversion: {e}")
+
+# Function to transcribe audio
+def transcribe_audio():
+    try:
+        logging.info("Transcribing audio...")
+        model = Model(model_path)
+        recognizer = KaldiRecognizer(model, 44100)
+
+        with wave.open(wav_audio_path, 'rb') as wav_file:
+            while True:
+                data = wav_file.readframes(4000)
+                if len(data) == 0:
+                    break
+                recognizer.AcceptWaveform(data)
+
+        result = json.loads(recognizer.FinalResult())
+        transcription_text = result.get("text", "")
+
+        with open(transcription_path, 'w') as file:
+            file.write(transcription_text)
+
+        logging.info("Transcription saved:")
+        logging.info(transcription_text)
+
+        analyze_text(transcription_text)
+    except Exception as e:
+        logging.error(f"Error during transcription: {e}")
+
+# Function to analyze transcribed text
+def analyze_text(text):
+    try:
+        logging.info("Analyzing transcription...")
+        words = text.split()
+        word_count = {}
+
+        for word in words:
+            word = word.lower().strip(".,!?;:\"'()[]{}")
+            word_count[word] = word_count.get(word, 0) + 1
+
+        repetitive_words = {word: count for word, count in word_count.items() if count > 1}
+        filler_words = {word: word_count.get(word, 0) for word in {"uh", "ah", "um", "so", "because"}}
+
+        total_word_count = len(words)
+        
+        save_feedback(repetitive_words, filler_words, total_word_count)
+        save_summary(total_word_count, filler_words, repetitive_words)
+    except Exception as e:
+        logging.error(f"Error analyzing text: {e}")
+
+# Function to save feedback
+def save_feedback(repetitive_words, filler_words, total_word_count):
+    try:
+        with open(feedback_path, 'w') as file:
+            file.write("=== Feedback ===\n")
+            file.write("\nRepetitive Words:\n")
+            for word, count in repetitive_words.items():
+                file.write(f"{word}: {count}\n")
+
+            file.write("\nFiller Words:\n")
+            for word, count in filler_words.items():
+                file.write(f"{word}: {count}\n")
+
+            file.write(f"\nTotal Word Count: {total_word_count}\n")
+
+        logging.info("Feedback saved.")
+    except Exception as e:
+        logging.error(f"Error saving feedback: {e}")
+
+# Function to save summary
+def save_summary(total_word_count, filler_words, repetitive_words):
+    try:
+        presentation_score = max(100 - len(repetitive_words) * 2, 0)
+        time_score = max(100 - sum(filler_words.values()) * 2, 0)
+        overall_score = (presentation_score + time_score) / 2
+
+        with open(summary_path, 'w') as file:
+            file.write("=== Summary ===\n")
+            file.write(f"Presentation Score: {presentation_score}\n")
+            file.write(f"Time Score: {time_score}\n")
+            file.write(f"Overall Score: {overall_score}\n")
+
+        logging.info("Summary saved.")
+    except Exception as e:
+        logging.error(f"Error saving summary: {e}")
+
+# Key listener
+def listen_for_stop_key():
+    global stop_receiving
+    logging.info("Press 's' to stop recording...")
+    while not stop_receiving:
+        if keyboard.is_pressed('s'):
+            stop_receiving = True
+            break
+        time.sleep(0.1)
+
+# Flask routes
+@app.route('/transcription.txt', methods=['GET'])
+def serve_transcription():
+    return serve_file(transcription_path, "Transcription file not found")
+
+@app.route('/feedback.txt', methods=['GET'])
+def serve_feedback():
+    return serve_file(feedback_path, "Feedback file not found")
+
+@app.route('/summary.txt', methods=['GET'])
+def serve_summary():
+    return serve_file(summary_path, "Summary file not found")
+
+def serve_file(filepath, error_message):
+    if os.path.exists(filepath):
+        return send_file(filepath, as_attachment=False)
+    else:
+        abort(404, description=error_message)
+
+# Main function
+def main():
+    global stop_receiving
+    key_thread = threading.Thread(target=listen_for_stop_key)
+    key_thread.start()
+
+    receive_audio()
+
+    key_thread.join()
+
+    if stop_receiving:
+        logging.info("Recording stopped by user.")
+
+    convert_to_wav()
+    transcribe_audio()
+
+    app.run(host="0.0.0.0", port=5000)
+
+if __name__ == "__main__":
+    main()
